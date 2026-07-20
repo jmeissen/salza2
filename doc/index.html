@@ -52,6 +52,7 @@ The latest version is 2.1, released on October 19th, 2021.
 	  <li> <a href='#callback'><tt>callback</tt></a>
 	  <li> <a href='#compress-octet'><tt>compress-octet</tt></a>
 	  <li> <a href='#compress-octet-vector'><tt>compress-octet-vector</tt></a>
+	  <li> <a href='#partial-flush-compression'><tt>partial-flush-compression</tt></a>
 	  <li> <a href='#finish-compression'><tt>finish-compression</tt></a>
 	  <li> <a href='#reset'><tt>reset</tt></a>
 	  <li> <a href='#with-compressor'><tt>with-compressor</tt></a>
@@ -200,6 +201,28 @@ following:
       do (compress-octet (aref vector i) compressor))
 </pre>
 
+</blockquote>
+
+
+<p><a name='partial-flush-compression'>[Generic function]</a><br>
+<b>partial-flush-compression</b> <i>compressor</i> => |
+
+<blockquote>
+Compresses all pending input, ends the current DEFLATE block, and invokes the
+user callback with every complete output octet available. The data format,
+checksum, and compression dictionary remain active so that subsequent input
+continues the same compressed stream. The compressor may retain up to seven
+output bits to be combined with subsequent compressed output.
+
+<p>This operation is suitable for protocols such as SSH that divide a
+continuous compressed stream across independently delivered packets. It does
+not replace <a href='#finish-compression'><tt>FINISH-COMPRESSION</tt></a> when a
+complete data format with its final block and trailer is required.
+
+<p><b>Security note:</b> Retaining a compression dictionary can reveal
+correlations through compressed output sizes. Do not use one compression
+context for both confidential and attacker-controlled data when an attacker
+can observe those sizes.
 </blockquote>
 
 
@@ -451,9 +474,10 @@ compressor-designator initargs)</tt>.
 <p>For example:
 
 <pre>
-* <b>(compress-data (sb-ext:string-to-octets "Hello, hello, hello, hello world.") 
+* <b>(compress-data (sb-ext:string-to-octets "Hello, hello, hello, hello world.")
                  'zlib-compressor)</b>
-#(8 153 243 72 205 201 201 215 81 200 192 164 20 202 243 139 114 82 244 0 194 64 11 139)
+#(120 156 242 72 205 201 201 215 81 200 192 164 20 202 243 139 114 82 244
+  0 3 0 194 64 11 139)
 </pre>
 </blockquote>
 

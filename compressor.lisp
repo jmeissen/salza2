@@ -45,38 +45,36 @@
   (declare (ignore args))
   (error "No callback given for compression"))
 
-;;; FIXME: MERGE-INPUT is pretty ugly. It's the product of incremental
-;;; evolution and experimentation. It should be cleaned up.
-;;;
-;;; Its basic purpose is to use octets from INPUT to fill up 32k-octet
-;;; halves of the 64k-octet OUTPUT buffer. Whenever a half fills up,
-;;; the COMPRESS-FUN is invoked to compress that half. At the end, a
-;;; partial half may remain uncompressed to be either filled by a
-;;; future call to MERGE-INPUT or to get flushed out by a call to
-;;; FINAL-COMPRESS.
+;;; Merge input into the 64k history ring. Pending input is tracked
+;;; independently of the physical 32k halves so that it can be compressed at
+;;; an arbitrary packet boundary and subsequent input will not be compressed
+;;; a second time.
 
-(defun merge-input (input start count output offset compress-fun)
-  "Merge COUNT octets from START of INPUT into OUTPUT at OFFSET;
-on reaching 32k boundaries within OUTPUT, call the COMPRESS-FUN
-with OUTPUT, a starting offset, and the count of pending data."
+(defun merge-input (input input-start count output output-offset
+                    pending-start pending-count compress-fun)
+  "Merge COUNT octets from INPUT-START of INPUT into OUTPUT.
+Whenever 32k octets are pending, call COMPRESS-FUN and start a new pending
+range. Return OUTPUT-OFFSET, PENDING-START, and PENDING-COUNT."
   (declare (type octet-vector input output))
-  (let ((i start)
-        (j (+ start (min count (- +input-limit+ (mod offset +input-limit+)))))
-        (result (logand +buffer-size-mask+ (+ offset count))))
-    (dotimes (k (ceiling (+ (logand offset +input-limit-mask+) count)
-                         +input-limit+))
-      (when (plusp k)
-        (funcall compress-fun
-                 output
-                 (logxor offset #x8000)
-                 +input-limit+))
-      (replace output input :start1 offset :start2 i :end2 j)
-      (setf offset (logand +input-limit+ (+ offset +input-limit+)))
-      (setf i j
-            j (min (+ start count) (+ j +input-limit+))))
-    (when (zerop (logand result +input-limit-mask+))
-      (funcall compress-fun output (logxor offset #x8000) +input-limit+))
-    result))
+  (let ((input-offset input-start))
+    (loop while (plusp count)
+          for copy-count = (min count
+                                (- +input-limit+ pending-count)
+                                (- +buffer-size+ output-offset))
+          do (replace output input
+                      :start1 output-offset
+                      :start2 input-offset
+                      :end2 (+ input-offset copy-count))
+             (incf input-offset copy-count)
+             (decf count copy-count)
+             (incf pending-count copy-count)
+             (setf output-offset
+                   (logand +buffer-size-mask+ (+ output-offset copy-count)))
+             (when (= pending-count +input-limit+)
+               (funcall compress-fun output pending-start pending-count)
+               (setf pending-start output-offset
+                     pending-count 0)))
+    (values output-offset pending-start pending-count)))
 
 (defun reinitialize-bitstream-funs (compressor bitstream)
   (setf (literal-fun compressor)
@@ -110,6 +108,12 @@ with OUTPUT, a starting offset, and the count of pending data."
    (counter
     :initarg :counter
     :accessor counter)
+   (block-open-p
+    :initarg :block-open-p
+    :accessor block-open-p)
+   (finished-p
+    :initarg :finished-p
+    :accessor finished-p)
    (octet-buffer
     :initarg :octet-buffer
     :accessor octet-buffer)
@@ -138,6 +142,8 @@ with OUTPUT, a starting offset, and the count of pending data."
    :start 0
    :end 0
    :counter 0
+   :block-open-p nil
+   :finished-p nil
    :bitstream (make-instance 'bitstream)
    :octet-buffer (make-octet-vector 1)))
 
@@ -161,6 +167,13 @@ with OUTPUT, a starting offset, and the count of pending data."
 
 (defgeneric finish-data-format (compressor)
   (:documentation "Add any needed epilogue data to the output bitstream."))
+
+(defgeneric partial-flush-compression (compressor)
+  (:documentation "Compress all pending input and emit enough compressed
+  output for a decompressor to consume it without ending the data format or
+  resetting compression history. Because compressed sizes can reveal matches
+  against retained history, do not use one compression context for both
+  confidential and attacker-controlled data when output sizes are observable."))
 
 (defgeneric finish-compression (compressor)
   (:documentation "Finish the data format and flush all pending
@@ -223,39 +236,78 @@ with OUTPUT, a starting offset, and the count of pending data."
                       :end end))
                                
 
-(defmethod start-data-format ((compressor deflate-compressor))
-  (let ((bitstream (bitstream compressor)))
-    (write-bits +final-block+ 1 bitstream)
-    (write-bits +fixed-tables+ 2 bitstream)))
+(defun ensure-compressor-active (compressor)
+  (when (finished-p compressor)
+    (error "Compression has already been finished for ~S" compressor)))
 
-(defmethod compress-octet (octet compressor)
+(defun start-fixed-block (compressor finalp)
+  (let ((bitstream (bitstream compressor)))
+    (write-bits (if finalp +final-block+ +non-final-block+) 1 bitstream)
+    (write-bits +fixed-tables+ 2 bitstream)
+    (setf (block-open-p compressor) t)))
+
+(defun end-fixed-block (compressor)
+  (when (block-open-p compressor)
+    (funcall (literal-fun compressor) 256)
+    (setf (block-open-p compressor) nil)))
+
+(defun emit-empty-fixed-block (compressor finalp)
+  (start-fixed-block compressor finalp)
+  (end-fixed-block compressor))
+
+(defmethod start-data-format ((compressor deflate-compressor))
+  (start-fixed-block compressor nil))
+
+(defmethod compress-octet (octet (compressor deflate-compressor))
   (let ((vector (octet-buffer compressor)))
     (setf (aref vector 0) octet)
     (compress-octet-vector vector compressor)))
 
-(defmethod compress-octet-vector (vector compressor &key (start 0) end)
+(defmethod compress-octet-vector (vector (compressor deflate-compressor)
+                                  &key (start 0) end)
+  (ensure-compressor-active compressor)
   (let* ((closure (compress-fun compressor))
          (end (or end (length vector)))
          (count (- end start)))
-    (let ((end
-           (merge-input vector start count
-                        (input compressor)
-                        (end compressor)
-                        closure)))
-      (setf (end compressor) end
-            (start compressor) (logand #x8000 end)
-            (counter compressor) (logand #x7FFF end)))))
+    (when (plusp count)
+      (unless (block-open-p compressor)
+        (start-fixed-block compressor nil))
+      (multiple-value-bind (output-offset pending-start pending-count)
+          (merge-input vector start count
+                       (input compressor)
+                       (end compressor)
+                       (start compressor)
+                       (counter compressor)
+                       closure)
+        (setf (end compressor) output-offset
+              (start compressor) pending-start
+              (counter compressor) pending-count)))))
 
 (defmethod process-input ((compressor deflate-compressor) input start count)
   (update-chains input (hashes compressor) (chains compressor) start count))
 
 (defmethod finish-data-format ((compressor deflate-compressor))
-  (funcall (literal-fun compressor) 256))
+  (end-fixed-block compressor)
+  (emit-empty-fixed-block compressor t))
+
+(defmethod partial-flush-compression ((compressor deflate-compressor))
+  (ensure-compressor-active compressor)
+  (when (block-open-p compressor)
+    (final-compress compressor)
+    (end-fixed-block compressor)
+    ;; RFC 4253 requires at least eight bits from the start of the current
+    ;; end-of-block code to the end of the packet. For Salza2's fixed blocks,
+    ;; this ten-bit empty fixed block provides the required trailing bits.
+    (emit-empty-fixed-block compressor nil))
+  (flush-complete-octets (bitstream compressor)))
 
 (defmethod finish-compression ((compressor deflate-compressor))
-  (final-compress compressor)
-  (finish-data-format compressor)
-  (flush (bitstream compressor)))
+  (unless (finished-p compressor)
+    (when (block-open-p compressor)
+      (final-compress compressor))
+    (finish-data-format compressor)
+    (flush (bitstream compressor))
+    (setf (finished-p compressor) t)))
 
 (defmethod final-compress ((compressor deflate-compressor))
   (let ((input (input compressor))
@@ -266,11 +318,14 @@ with OUTPUT, a starting offset, and the count of pending data."
         (literal-fun (literal-fun compressor))
         (length-fun (length-fun compressor))
         (distance-fun (distance-fun compressor)))
-    (process-input compressor input start counter)
-    (compress input chains start end
-              literal-fun
-              length-fun
-              distance-fun)))
+    (when (plusp counter)
+      (process-input compressor input start counter)
+      (compress input chains start end
+                literal-fun
+                length-fun
+                distance-fun)
+      (setf (start compressor) end
+            (counter compressor) 0))))
 
 (defmethod make-compress-fun ((compressor deflate-compressor))
   (let ((literal-fun (literal-fun compressor))
@@ -290,7 +345,9 @@ with OUTPUT, a starting offset, and the count of pending data."
   (fill (hashes compressor) 0)
   (setf (start compressor) 0
         (end compressor) 0
-        (counter compressor) 0)
+        (counter compressor) 0
+        (block-open-p compressor) nil
+        (finished-p compressor) nil)
   (reset (bitstream compressor))
   (start-data-format compressor))
 

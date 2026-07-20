@@ -110,4 +110,5 @@
                            (error "Tests failed")))
   :pathname "test/"
   :components ((:file "package")
-               (:file "stream" :depends-on ("package"))))
+               (:file "stream" :depends-on ("package"))
+               (:file "partial-flush" :depends-on ("package"))))

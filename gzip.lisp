@@ -73,7 +73,14 @@ the decompressor.")
 (defmethod process-input :after ((compressor gzip-compressor)
                                  input start count)
   (incf (data-length compressor) count)
-  (update (checksum compressor) input start count))
+  ;; Partial flushes can leave the next pending range at an arbitrary point
+  ;; in the circular history buffer. CRC32 processes ordinary contiguous
+  ;; vectors, so split a range that wraps rather than reading past INPUT.
+  (let ((first-count (min count (- (length input) start)))
+        (checksum (checksum compressor)))
+    (update checksum input start first-count)
+    (when (< first-count count)
+      (update checksum input 0 (- count first-count)))))
 
 (defmethod finish-data-format :after ((compressor gzip-compressor))
   (gzip-write-u32 (result (checksum compressor)) compressor)

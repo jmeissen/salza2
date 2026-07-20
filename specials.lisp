@@ -44,5 +44,6 @@
 (defparameter +bitstream-buffer-bits+ (* +bitstream-buffer-size+ 8))
 (defparameter +bitstream-buffer-bitmask+ (1- +bitstream-buffer-bits+))
 
+(defconstant +non-final-block+ #b0)
 (defconstant +final-block+ #b1)
 (defconstant +fixed-tables+ #b01)

@@ -118,6 +118,7 @@
 (defgeneric write-bits (code size bitstream))
 (defgeneric write-octet (octet bitstream))
 (defgeneric write-octet-vector (vector bitstream &key start end))
+(defgeneric flush-complete-octets (bitstream))
 (defgeneric flush (bitstream))
 
 (defmethod write-bits (code size (bitstream bitstream))
@@ -139,6 +140,22 @@
   (let ((end (or end (length vector))))
     (loop for i from start below end
           do (write-octet (aref vector i) bitstream))))
+
+(defmethod flush-complete-octets ((bitstream bitstream))
+  (multiple-value-bind (end remaining-bits)
+      (floor (bits bitstream) 8)
+    ;; Save the partial octet before invoking the callback because the
+    ;; callback is permitted to consume BUFFER synchronously.
+    (let* ((buffer (buffer bitstream))
+           (partial-octet
+             (when (plusp remaining-bits)
+               (logand (1- (ash 1 remaining-bits))
+                       (aref buffer end)))))
+      (when (plusp end)
+        (funcall (callback bitstream) buffer end))
+      (when partial-octet
+        (setf (aref buffer 0) partial-octet))
+      (setf (bits bitstream) remaining-bits))))
 
 (defmethod flush ((bitstream bitstream))
   (let ((end (ceiling (bits bitstream) 8)))

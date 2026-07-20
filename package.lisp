@@ -42,6 +42,7 @@
    #:compress-octet-vector
    #:process-input
    #:finish-data-format
+   #:partial-flush-compression
    #:finish-compression
    #:with-compressor
    ;; zlib
